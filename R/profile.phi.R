@@ -1,0 +1,479 @@
+#' @title MLE estimation of the shape of a binomial link function
+#' @description This function takes a model object with a family argument, and estimates a parameter phi that controls the shape of the link function.
+#'
+#' @param model a model object which accepts a family argument (should correspond to "binomial") with a link function. The model should have corresponding \code{"\link{update}"} and \code{"\link{logLik}"} functionality implemented.
+#' @param y response variable.
+#' @param optimizer numerical optimisation routine used to estimate phi. Must accept the starting value, objective function, gradient, and control arugments (in that order). Defaults to \code{"\link{optim}"}.
+#' @param optControl control arguments passed to optimizer.
+#' @param optArgs other arguments passed on to the optimizer as a list.
+#' @param warmstart logical, defaults to \code{TRUE}. If \code{TRUE}, each trial phi is fit starting from the coefficients of the best-fitting model found so far in the search, rather than always restarting from the coefficients of the initial \code{model}.
+#' @param ... other arguments passed to \code{"\link{update}"}.
+#'
+#' @return The optimisation results of the profiling, with log(phi) as the estimated parameter.
+#'
+#' @author Bert van der Veen
+#' @references
+#' van der Veen and Hui (2025). In prep.
+#'
+#'@examples
+#'# Define logit link via gcloglog
+#'library(gcloglog)
+#'gcloglog1 <- make.gcloglog(1)
+#'
+#'# Fit logistic regression with gcloglog
+#'x <- rnorm(100)
+#'b1 = 2.3
+#'b0 = 0.1
+#'eta = b0+b1*x
+#'y = rbinom(length(x), 1, plogis(eta))
+#'data <- data.frame(y = y,x = x)
+#'model <- glm(y~x, family = binomial(link = gcloglog1), data = data)
+#'
+#'# Find optimal link shape by profiling phi
+#'res <- profile.phi(model, y = model.response(model.frame(model)))
+#'exp(res$optr$par) # extract phi
+#'
+#' @importFrom nloptr bobyqa
+#' @importFrom stats approx binomial coef family logLik model.frame model.response nlminb
+#'   plogis predict qchisq spline update weights
+#' @importFrom graphics abline mtext
+#' @importFrom utils tail
+#'
+#' @rdname profile.phi
+#' @export
+#' @method profile.phi glm
+profile.phi.glm <- function(model, y, optimizer = nlminb, optControl = list(iter.max = 500, eval.max = 500), optArgs = list(lower = log(1.400882e-08)), warmstart = TRUE, ...){
+  N <- weights(model)
+  if(is.matrix(y))y  <- y[,1]/N
+
+  # mutable state shared across optimizer callbacks, so that a better-fitting
+  # model found for one trial phi can warm-start the next trial phi
+  state <- new.env(parent = emptyenv())
+  state$model <- model
+  state$nll0 <- -logLik(model)
+  state$warmstart <- warmstart
+
+  logphi.start = log(1.01)
+
+  optr <- try(do.call(optimizer, c(list(logphi.start, fn.glm, gr.glm, control = optControl, state = state, y = y, N = N), optArgs)))
+
+  # Search a bit for a start
+  if(inherits(optr,"try-error")){
+    maxit = 20
+    it <- 1
+    while(inherits(optr,"try-error") && it  < maxit){
+      logphi.start <- logphi.start + 0.1
+    optr <- try(do.call(optimizer, c(list(logphi.start, fn.glm, gr.glm, control = optControl, state = state, y = y, N = N), optArgs)))
+    it <- it + 1
+    }
+  }
+
+  return(list(optr = optr, start = coef(state$model)))
+}
+
+# objective in the GLM case
+gr.glm <- function(logphi, state, y, N, ...){
+  phi = exp(logphi)
+  gcloglog <- make.gcloglog(phi)
+
+  model <- state$model
+
+  args <- list(...)
+  args$y <- NULL
+  args$N <- NULL
+
+  args$object = model
+  args$family = binomial(link = gcloglog)
+
+  args$start = coef(model)
+
+  fit <- try(newmodelgr <- do.call(update, args), silent = TRUE)
+
+  if(inherits(fit, "try-error") && !is.null(args$start) || !newmodelgr$converged && !is.null(args$start)){
+    args$start <- NULL
+    # try without starting values
+    fit <- try(newmodelgr <- do.call(update, args), silent = TRUE)
+  }
+
+  if(inherits(fit, "try-error")){
+    # nlminb errors on NA/NaN rather than backtracking; return a large
+    # finite gradient pointing back toward more moderate phi instead
+    sign(logphi) * 1e6
+  }else{
+    eta = predict(newmodelgr)
+    p = predict(newmodelgr, type="response")
+    q = 1-p
+
+    # gradient for nll
+    g <- -sum(N*phi^-1*(y/p-(1-y)/(1-p))*q*(phi*log(q)+1-exp(phi*log(q))))
+    if(!is.finite(g)) sign(logphi) * 1e6 else g
+  }
+}
+
+#' @rdname profile.phi
+#' @export
+#' @method profile.phi merMod
+profile.phi.merMod <- function(model, y, optimizer = bobyqa, optControl = list(maxit = 500), optArgs = NULL, warmstart = TRUE, ...){
+
+  # mutable state shared across optimizer callbacks, so that a better-fitting
+  # model found for one trial phi can warm-start the next trial phi
+  state <- new.env(parent = emptyenv())
+  state$model <- model
+  state$nll0 <- -logLik(model)
+  state$warmstart <- warmstart
+
+  # Here we do gradient free optimisatin
+  optr <- do.call(optimizer, c(list(log(1.01), fn.merMod, control = optControl, state = state, y = y), optArgs))
+
+  return(list(optr = optr, start = list(fixef = lme4::fixef(state$model),
+                                                     theta =  lme4::getME(state$model, "theta"))))
+}
+
+#' @rdname profile.phi
+#' @export
+#' @method profile.phi default
+profile.phi.default <- function(model, y, optimizer = bobyqa, optControl = list(maxit = 500), optArgs = NULL, ...){
+  # still needs to be adjusted for N>1 case
+  # Here we do gradient free optimisatin
+  # The "general" class of models is harder to implement analytical derivatives for..
+
+  optr <- do.call(optimizer, list(log(1.01), fn.generic, control = optControl, model = model, optArgs))
+
+  return(list(optr = optr))
+}
+
+#' @rdname profile.phi
+#' @export
+profile.phi <- function(model, ...) {
+  UseMethod("profile.phi")
+}
+
+fn.glm <- function(logphi, state, ...){
+  phi = exp(logphi)
+  gcloglog <- make.gcloglog(phi)
+
+  model <- state$model
+  nll0 <- state$nll0
+
+  args <- list(...)
+  args$y <- NULL
+  args$N <- NULL
+
+  args$object = model
+  args$family = binomial(link = gcloglog)
+
+  args$start = coef(model)
+
+  fit <- try(newmodelfn <- do.call(update, args), silent = TRUE)
+
+  if(inherits(fit, "try-error") && !is.null(args$start) || !newmodelfn$converged && !is.null(args$start)){
+    args$start <- NULL
+    # try without starting values
+    fit <- try(newmodelfn <- do.call(update, args), silent = TRUE)
+  }
+
+  if(inherits(fit, "try-error")){
+    # nlminb errors on NA/NaN rather than backtracking; return a large
+    # finite penalty, growing with distance from the origin, instead
+    nll0 + 1e6 + abs(logphi)*1e3
+  }else{
+    nll <- -logLik(newmodelfn)
+    if(!is.finite(nll)) nll <- nll0 + 1e6 + abs(logphi)*1e3
+    if(state$warmstart && is.finite(nll) && nll < nll0){
+      # improving starting values of glm
+      state$model <- newmodelfn
+      state$nll0 <- nll
+      }
+    nll
+  }
+}
+
+fn.merMod <- function(logphi, state, ...){
+  phi = exp(logphi)
+  gcloglog <- make.gcloglog(phi)
+
+  model <- state$model
+  nll0 <- state$nll0
+
+  args <- list(...)
+  args$y <- NULL
+  args$N <- NULL
+
+  args$object = model
+  args$family = binomial(link = gcloglog)
+
+  args$start = list(fixef = lme4::fixef(model),
+                    theta =  lme4::getME(model, "theta"))
+
+  fit <- try(newmodelfn <- do.call(update, args), silent = TRUE)
+
+  if(inherits(fit, "try-error") && !is.null(args$start)){
+    args$start <- NULL
+    # try without starting values
+    fit <- try(newmodelfn <- do.call(update, args), silent = TRUE)
+  }
+
+  if(inherits(fit, "try-error")){
+    NA
+  }else{
+    nll <- -logLik(newmodelfn)
+    if(state$warmstart && nll < nll0){
+      # improving starting values of glm
+      state$model <- newmodelfn
+      state$nll0 <- nll
+      }
+    nll
+  }
+}
+
+fn.generic <- function(logphi, model, ...){
+  phi = exp(logphi)
+  gcloglog <- make.gcloglog(phi)
+
+  args <- list(...)
+
+  args$object = model
+  args$family = binomial(link = gcloglog)
+
+  fit <- try(newmodelfn <- do.call(update, args), silent = TRUE)
+
+  if(inherits(fit, "try-error")){
+    NA
+  }else{
+    -logLik(newmodelfn)
+  }
+}
+
+profile_phi_CI <- function(logphi.mle, model,
+                           h = 0.02, ytol = 2, ystep = 0.1,
+                           maxit = 100, adaptive = TRUE, trace = TRUE, warmstart = TRUE, ...) {
+
+  if(inherits(model, "glm")){
+    # mutable state shared across profiling steps, so that a nearby model fit
+    # can warm-start the next step along the profile
+    state <- new.env(parent = emptyenv())
+    state$model <- model
+    state$nll0 <- -logLik(model)
+    state$warmstart <- warmstart
+    fn <- function(logphi.mle, ...)fn.glm(logphi.mle, state, ...)
+  }else  if(inherits(model, "merMod")){
+    state <- new.env(parent = emptyenv())
+    state$model <- model
+    state$nll0 <- -logLik(model)
+    state$warmstart <- warmstart
+    fn <- function(logphi.mle, ...)fn.merMod(logphi.mle, state, ...)
+  }else{
+    fn <- function(logphi.mle, ...)fn.generic(logphi.mle, model, ...)
+  }
+
+  nll.mle <- fn(logphi.mle, ...)
+
+  eval_along <- function(start, direction) {
+    x <- start
+    yvals <- nll.mle
+    hcurrent <- h
+    iter <- 0
+
+    repeat {
+      iter <- iter + 1
+      if (iter > maxit) break
+
+      xnext <- tail(x, 1) + direction * hcurrent
+      nllnext <- tryCatch(fn(xnext, ...), error=function(e) NA)
+
+      # If NA, shrink step and try again
+      if (is.na(nllnext)) {
+        hcurrent <- hcurrent / 2
+        if (hcurrent < 1e-6) break
+        next
+      }
+
+      # Stop if drop exceeds tolerance
+      if ((nllnext-nll.mle) > ytol) break
+
+      # Append
+      x <- c(x, xnext)
+      yvals <- c(yvals, nllnext)
+
+      # Adaptive step only if at least 2 differences
+      if (adaptive && length(yvals) > 2) {
+        delta <- abs(yvals[length(yvals)] - yvals[length(yvals)-1])
+        if (delta > ystep) hcurrent <- hcurrent / 2
+        if (delta < ystep/4) hcurrent <- hcurrent * 2
+      }
+    }
+
+    data.frame(logphi = x, logLik = -yvals)
+  }
+
+  if (trace) cat("Profiling downwards\n")
+  down <- eval_along(logphi.mle, -1)
+  if (trace) cat("Profiling upwards\n")
+  # Ensure that we step enough for a CI even if the likelihood is flat on the left
+  # Remove everyting below the thresold for phi in make.gcloglog
+  down <- down[down$logphi>=log(1.400882e-08), ,drop=FALSE]
+  ytol.down <- -nll.mle-min(down$logLik)
+  if(ytol.down<ytol)ytol = ytol + 2-ytol.down
+
+  up <- eval_along(logphi.mle, 1)
+
+  out <- rbind(up, down)
+  out <- out[order(out$logphi), ]
+  rownames(out) <- NULL
+  return(out)
+}
+
+#' @title MLE estimation of the shape of a binomial link function
+#' @description This function takes a model object, estimates a parameter phi that controls the shape of the link function, and performs further profiling for retrieving a confidence interval. The implementation heavily borrows from \code{tmbprofile} in the \pkg{TMB} package.
+#'
+#' @param model a model object which accepts a family argument (should correspond to "binomial") with a link function. The model should have corresponding \code{"\link{update}"} and \code{"\link{logLik}"} functionality implemented.
+#' @param CI logical, defaults to \code{TRUE}.
+#' @param alpha the confidence level, defaults to 0.05.
+#' @param plot logical, defaults to \code{TRUE}, so that a plot of the profiling is displayed. Only when CI is set to \code{TRUE}.
+#' @param h initial adaptive stepsize.
+#' @param ytol Adjusts the range of the likelihood values.
+#' @param ystep Adjusts the reoslution of the likelihood profile.
+#' @param maxit Maximum number of iterations for the adaptive algorithm.
+#' @param adaptive logical, defaults to \code{TRUE}. Implements adaptive step size.
+#' @param trace logical, defaults to \code{TRUE}. Prints progress.
+#' @param warmstart logical, defaults to \code{TRUE}. If \code{TRUE}, each trial phi is fit starting from the coefficients of the best-fitting model found so far, rather than always restarting from the coefficients of the initial \code{model}.
+#' @param ... other arguments passed to \code{"\link{profile.phi}"}.
+#'
+#' @return A list including the optimisation results, CI, and final model fit.
+#'
+#' @details The final model inherits from class \code{"gcloglog"}, so that its \code{vcov},
+#' \code{summary}, and \code{confint} return standard errors that account for the
+#' estimation of phi; \code{vcov(..., correct = FALSE)} and
+#' \code{summary(..., correct = FALSE)} give those conditional on phi. \code{confint}
+#' defaults to Wald confidence intervals from the corrected covariance; \code{method = "profile"}
+#' (and \code{"boot"} for \code{glmer} fits) are other options conditional on phi.
+#'
+#' For a \code{glm}, the corrected asymptotic covariance is the naive covariance conditional
+#' on the estimated link shape, plus a rank-one update, which follows from the 
+#' joint information of the coefficients and log(phi). For a \code{glmer} fit, it 
+#' is the fixed-effect block of the inverse of the joint Hessian of the 
+#' Laplace-approximated log-likelihood in the random-effect parameters (lme4's theta),
+#' the fixed effects, and log(phi), obtained by finite differences
+#' (\code{\link[numDeriv]{hessian}}). Random-effect parameters at their boundary (a
+#' singular fit) are held fixed.
+#'
+#' The correction does not apply when the estimate of phi is at the boundary phi = 0,
+#' where the fit is equivalent to cloglog regression (detected as the fit not improving
+#' on the log-likelihood of the cloglog link at the same parameter estimates by more
+#' than 1e-5), or when the joint information is not positive definite. In those cases
+#' the standard errors are conditional on phi, with a warning from \code{vcov} and
+#' \code{confint}, and a note in the printed \code{summary}.
+#'
+#' @author Bert van der Veen
+#' @references
+#' van der Veen and Hui (2025). In prep.
+#'
+#'@examples
+#'# Define logit link via gcloglog
+#'library(gcloglog)
+#'gcloglog1 <- make.gcloglog(1)
+#'
+#'# Profile the gcloglog link
+#'x <- rnorm(100)
+#'b1 = 2.3
+#'b0 = 0.1
+#'eta = b0+b1*x
+#'y = rbinom(length(x), 1, plogis(eta))
+#'data <- data.frame(y = y,x = x)
+#'model <- glm(y~x, family = binomial(link = gcloglog1), data = data)
+#'res <- profile.gcloglog(model)
+#'
+#'final.model <- res$final.model
+#'summary(final.model)                 # standard errors account for the estimate of phi
+#'confint(final.model)
+#'summary(final.model)                 # conditional on the estimate of phi
+#'vcov(final.model, correct = FALSE)   # conditional on the estimate of phi
+#' @export profile.gcloglog
+profile.gcloglog <- function(model, CI = TRUE, alpha = 0.05, plot = TRUE, h = 0.02, ytol = 2, ystep = 0.1,
+                             maxit = 100, adaptive = TRUE, trace = TRUE, warmstart = TRUE, ...){
+
+  if(!grepl("gcloglog", family(model)$link)){
+    model <- update(model, family = binomial(link = make.gcloglog(1)))
+  }
+
+  res <- profile.phi(model = model, y = model.response(model.frame(model)), warmstart = warmstart, ...)
+  logphi.mle  <- res$optr$par
+
+  # if(inherits(model, "glm")){
+  #   # check convergence
+  #   args <- list(...)
+  #   if(!"optimizer" %in% names(args)){
+  #     if(res$optr$convergence>0){
+  #warning("Optimiser did not converge. Trying with larger number of iterations")
+  #     args$optControl <- list(maxit = 1e6)
+  #     res <- do.call(profile.phi, model = model, y = model.response(model.frame(model)), args)
+  #}
+  #   }
+  # }
+
+  gcloglog = make.gcloglog(exp(logphi.mle))
+  if(inherits(model, "glm")){
+    final.model <- try(update(model, family = binomial(link=gcloglog), start = res$start), silent = TRUE)
+    if(inherits(final.model, "try-error") || !is.null(res$start) && !final.model$converged)final.model <- try(update(model, family = binomial(link=gcloglog), start = NULL), silent = TRUE)
+  }else{
+    final.model <- try(update(model, family = binomial(link=gcloglog), start = res$start), silent = TRUE)
+    if(inherits(final.model, "try-error")){
+      # retry without starting values
+      final.model <- try(update(model, family = binomial(link=gcloglog), start = NULL), silent = TRUE)
+    }
+    if(inherits(final.model, "try-error") && inherits(model, "merMod")){
+      # custom link objects are numerically fragile in glmer's default nAGQ path
+      # (see e.g. "Downdated VtV is not positive definite"); nAGQ=0 with a
+      # theta-only start is a more stable fallback
+      theta.start <- if(is.list(res$start) && !is.null(res$start$theta)) res$start$theta else lme4::getME(model, "theta")
+      final.model <- try(update(model, family = binomial(link=gcloglog), start = theta.start, nAGQ = 0), silent = TRUE)
+    }
+  }
+
+  if(inherits(final.model, "try-error")){
+    stop("Failed to fit the final model at the profiled phi. Last error: ", conditionMessage(attr(final.model, "condition")))
+  }
+
+  logLik.mle <- logLik(final.model)
+  prof <- NULL
+  ans = NA
+
+  if(CI){
+    prof <- profile_phi_CI(logphi.mle, final.model, h = h, ytol = ytol, ystep = ystep, maxit = maxit, adaptive = adaptive, trace = trace, warmstart = warmstart)
+    prof$phi <- exp(prof$logphi)
+    prof <- prof[, -1]
+
+    tmp <- try({
+      li <- prof[prof$phi < exp(logphi.mle), ]
+      ui <- prof[prof$phi > exp(logphi.mle), ]
+
+      ans <- numeric(2)
+      threshold <- logLik.mle-0.5 * qchisq(1-alpha, df = 1)
+
+      sp <- spline(x = li[, "phi"], y = li[, "logLik"])
+      ans[1] <- approx(sp$y, sp$x, xout = threshold)$y
+      if(is.na(ans[1]))ans[1]<- 0
+      sp <- spline(x = ui[, "phi"], y = ui[, "logLik"])
+      ans[2] <- approx(sp$y, sp$x, xout = threshold)$y
+    })
+    if(inherits(tmp,"try-error")){ans <- NA;print(tmp)}
+
+    if(plot){
+      plot(y = prof$logLik, prof$phi, type = "l", ylab = "log-likelihood", xlab = expression(hat(phi)), xlim = range(prof$phi))
+
+      abline(v = ans[1], lty = "dotted")
+      abline(v = ans[2], lty = "dotted")
+      abline(v = exp(logphi.mle), col = "blue", lty = "dashed");mtext(at = exp(logphi.mle), side = 1, padj = 1, expression(hat(phi[max])), col = "blue")
+      abline(v = 1, col = "red", lty = "dashed");mtext(at = 1.1, padj = -1, "logit", col = "red")
+      abline(v = 0, col = "red", lty = "dashed");mtext(at = 0, padj = -1, "cloglog", col = "red")
+
+    }
+  }
+
+
+  final.model <- as.gcloglog(final.model)
+
+  return(list(phi.mle = exp(logphi.mle), final.model = final.model, CI = ans, prof = prof))
+}
+
+

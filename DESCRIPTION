@@ -1,0 +1,22 @@
+Package: gcloglog
+Title: Methods for Fitting Binomial Models with the Generalized
+        Complementary Log-Log Function
+Version: 1.0
+Date: 2026-10-16
+Authors@R: c(person("Bert", "van der Veen", role = c("aut", "cre"), email = "bert_van_der_veen@hotmail.com"),
+             person("Francis K.C.", "Hui", role = "aut"))
+Maintainer: Bert van der  Veen <bert_van_der_veen@hotmail.com>
+Description: Functionality for fitting a flexible link function in binomial regression based on a latent negative-binomial count. The original link function was proposed by Aranda-Ordaz (1981)<doi:10.1093/biomet/68.2.357>, and motivation via a negative-binomial latent count by van der Veen and Hui (in prep).
+License: GPL (>= 2)
+Imports: graphics, lme4, Matrix, methods, nloptr, numDeriv, stats,
+        utils
+Encoding: UTF-8
+RoxygenNote: 7.3.3
+URL: https://github.com/BertvanderVeen/gcloglog
+BugReports: https://github.com/BertvanderVeen/gcloglog/issues
+NeedsCompilation: no
+Packaged: 2026-10-16 11:36:32 UTC; bertv
+Author: Bert van der Veen [aut, cre],
+  Francis K.C. Hui [aut]
+Repository: CRAN
+Date/Publication: 2026-10-27 15:50:02 UTC
